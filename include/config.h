@@ -4,8 +4,6 @@
 // Change these two to match your wiring.
 #define LED_PIN        16
 #define NUM_LEDS       60
-#define LED_TYPE       WS2812B
-#define COLOR_ORDER    GRB
 
 // ---- Networking ----
 #define AP_NAME        "ESP32-Clock-Setup"   // hotspot name shown during first-time config

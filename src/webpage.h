@@ -62,7 +62,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div><label>Minute hand</label><input type="color" id="minuteColor"></div>
       <div><label>Second hand</label><input type="color" id="secondColor"></div>
       <div><label>Tick marks</label><input type="color" id="tickColor"></div>
+      <div><label>Sweep trail</label><input type="color" id="trailColor"></div>
     </div>
+    <label>Colour presets</label>
+    <div class="btnbar" id="presetBar"></div>
     <label>Brightness</label>
     <input type="range" id="brightness" min="4" max="255" step="1">
     <div class="row">
@@ -72,6 +75,21 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           <option value="0">Off</option>
           <option value="1">Dim hour ticks</option>
           <option value="2">Rainbow sweep</option>
+          <option value="3">Rainbow + twinkling ticks</option>
+        </select>
+      </div>
+      <div>
+        <label>Hand style</label>
+        <select id="style">
+          <option value="0">Classic dot</option>
+          <option value="1">Sweeping trail (second hand)</option>
+        </select>
+      </div>
+      <div>
+        <label>Trail position</label>
+        <select id="trailUnderHands">
+          <option value="false">Over hands</option>
+          <option value="true">Under hands</option>
         </select>
       </div>
       <div>
@@ -82,7 +100,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         </select>
       </div>
     </div>
-    <label>Timezone (POSIX TZ string)</label>
+    <label>Rotation offset (shift "12 o'clock", -60 to 60 pixels)</label>
+    <input type="range" id="rotationOffset" min="-60" max="60" step="1">
+    <div class="row">
+      <div class="switch">
+        <input type="checkbox" id="bstEnabled">
+        <label style="margin:0">UK time (auto GMT/BST)</label>
+      </div>
+    </div>
+    <label>Timezone (POSIX TZ string, used when UK auto-BST is off)</label>
     <input type="text" id="timezone" placeholder="GMT0BST,M3.5.0/1,M10.5.0">
     <div class="btnbar">
       <button onclick="saveConfig()">Save style</button>
@@ -112,6 +138,32 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
 <script>
 const DAY_LABELS = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+const COLOR_PRESETS = [
+  { name: 'Classic', hourColor: '#ff3c00', minuteColor: '#00c8ff', secondColor: '#ff00a0' },
+  { name: 'Sunset',  hourColor: '#ff6a00', minuteColor: '#ffce00', secondColor: '#ff003c' },
+  { name: 'Ocean',   hourColor: '#0077ff', minuteColor: '#00e5ff', secondColor: '#00ffa2' },
+  { name: 'Forest',  hourColor: '#2ecc71', minuteColor: '#f1c40f', secondColor: '#e67e22' },
+  { name: 'Mono',    hourColor: '#ffffff', minuteColor: '#aaaaaa', secondColor: '#555555' },
+  { name: 'Neon',    hourColor: '#ff00ff', minuteColor: '#00ffff', secondColor: '#ffff00' }
+];
+
+function applyPreset(preset){
+  hourColor.value = preset.hourColor;
+  minuteColor.value = preset.minuteColor;
+  secondColor.value = preset.secondColor;
+  saveConfig();
+}
+
+function renderPresets(){
+  presetBar.innerHTML = '';
+  COLOR_PRESETS.forEach(preset => {
+    const btn = document.createElement('button');
+    btn.className = 'secondary';
+    btn.textContent = preset.name;
+    btn.onclick = () => applyPreset(preset);
+    presetBar.appendChild(btn);
+  });
+}
 
 async function loadStatus(){
   try{
@@ -132,9 +184,14 @@ async function loadConfig(){
   minuteColor.value = c.minuteColor;
   secondColor.value = c.secondColor;
   tickColor.value = c.tickColor;
+  trailColor.value = c.trailColor;
   brightness.value = c.brightness;
   bgMode.value = c.bgMode;
+  style.value = c.style;
+  trailUnderHands.value = c.trailUnderHands ? 'true' : 'false';
+  rotationOffset.value = c.rotationOffset;
   use24Hour.value = c.use24Hour ? 'true' : 'false';
+  bstEnabled.checked = c.bstEnabled;
   timezone.value = c.timezone;
 }
 
@@ -144,9 +201,14 @@ async function saveConfig(){
     minuteColor: minuteColor.value,
     secondColor: secondColor.value,
     tickColor: tickColor.value,
+    trailColor: trailColor.value,
     brightness: parseInt(brightness.value,10),
     bgMode: parseInt(bgMode.value,10),
+    style: parseInt(style.value,10),
+    trailUnderHands: trailUnderHands.value === 'true',
+    rotationOffset: parseInt(rotationOffset.value,10),
     use24Hour: use24Hour.value === 'true',
+    bstEnabled: bstEnabled.checked,
     timezone: timezone.value
   };
   await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -211,6 +273,7 @@ async function resetWifi(){
 loadStatus();
 loadConfig();
 loadAlarms();
+renderPresets();
 setInterval(loadStatus, 1000);
 </script>
 </body>

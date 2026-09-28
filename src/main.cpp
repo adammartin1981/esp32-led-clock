@@ -4,7 +4,7 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <FastLED.h>
+#include <Adafruit_NeoPixel.h>
 #include <time.h>
 
 #include "config.h"
@@ -14,18 +14,80 @@
 // State
 // ---------------------------------------------------------------------------
 
-CRGB leds[NUM_LEDS];
+struct RGB {
+  uint8_t r = 0, g = 0, b = 0;
+  constexpr RGB() {}
+  constexpr RGB(uint8_t r_, uint8_t g_, uint8_t b_) : r(r_), g(g_), b(b_) {}
+  RGB &operator+=(const RGB &o) {
+    r = min(255, r + o.r);
+    g = min(255, g + o.g);
+    b = min(255, b + o.b);
+    return *this;
+  }
+};
+constexpr RGB COLOR_BLACK(0, 0, 0);
+constexpr RGB COLOR_RED(255, 0, 0);
+constexpr RGB COLOR_GREEN(0, 255, 0);
+
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+RGB leds[NUM_LEDS];
 AsyncWebServer server(WEB_PORT);
 Preferences prefs;
+
+void fillSolid(RGB *arr, uint16_t count, const RGB &color) {
+  for (uint16_t i = 0; i < count; i++) arr[i] = color;
+}
+
+void pushLeds() {
+  for (uint16_t i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, strip.Color(leds[i].r, leds[i].g, leds[i].b));
+  }
+  strip.show();
+}
+
+RGB hsvToRgb(uint8_t h, uint8_t s, uint8_t v) {
+  if (s == 0) return RGB(v, v, v);
+  uint8_t region = h / 43;
+  uint8_t remainder = (h - (region * 43)) * 6;
+  uint8_t p = (v * (255 - s)) >> 8;
+  uint8_t q = (v * (255 - ((s * remainder) >> 8))) >> 8;
+  uint8_t t = (v * (255 - ((s * (255 - remainder)) >> 8))) >> 8;
+  switch (region) {
+    case 0:  return RGB(v, t, p);
+    case 1:  return RGB(q, v, p);
+    case 2:  return RGB(p, v, t);
+    case 3:  return RGB(p, q, v);
+    case 4:  return RGB(t, p, v);
+    default: return RGB(v, p, q);
+  }
+}
+
+// Sine wave between lo and hi, cycling at the given beats-per-minute.
+uint8_t beatsin8(uint8_t bpm, uint8_t lo, uint8_t hi) {
+  float phase = (millis() * bpm) / 60000.0f;
+  float wave = (sinf(phase * 2.0f * PI) + 1.0f) / 2.0f;
+  return lo + static_cast<uint8_t>(wave * (hi - lo));
+}
+
+enum ClockStyle : uint8_t {
+  STYLE_CLASSIC = 0,   // hour/minute/second hands as single dots
+  STYLE_SWEEP   = 1,   // second hand rendered as a 5-LED fading comet trail
+  STYLE_COUNT   = 2
+};
 
 struct ClockConfig {
   uint8_t brightness = 120;
   uint8_t bgMode = 1;              // 0=off, 1=dim ticks, 2=rainbow sweep
+  uint8_t style = STYLE_CLASSIC;
+  int8_t rotationOffset = 0;       // shifts the ring's "12 o'clock" position, -60..+60
   bool use24Hour = true;
-  CRGB hourColor   = CRGB(255, 60, 0);
-  CRGB minuteColor = CRGB(0, 200, 255);
-  CRGB secondColor = CRGB(255, 0, 160);
-  CRGB tickColor   = CRGB(20, 20, 20);
+  bool bstEnabled = true;          // true = auto UK GMT/BST rule, false = use `timezone` verbatim
+  bool trailUnderHands = false;    // STYLE_SWEEP only: false = trail draws over hour/minute hands
+  RGB hourColor   = RGB(255, 60, 0);
+  RGB minuteColor = RGB(0, 200, 255);
+  RGB secondColor = RGB(255, 0, 160);
+  RGB tickColor   = RGB(20, 20, 20);
+  RGB trailColor  = RGB(255, 0, 160);
   String timezone  = DEFAULT_TZ;
 } cfg;
 
@@ -35,7 +97,7 @@ struct Alarm {
   uint8_t minute = 0;
   uint8_t days = 0b0111110;        // bit0=Sun..bit6=Sat, default Mon-Fri
   String label = "Alarm";
-  CRGB color = CRGB(255, 0, 0);
+  RGB color = RGB(255, 0, 0);
 };
 
 Alarm alarms[MAX_ALARMS];
@@ -49,16 +111,16 @@ int8_t lastAlarmCheckedMinute = -1;
 // Colour helpers
 // ---------------------------------------------------------------------------
 
-String colorToHex(const CRGB &c) {
+String colorToHex(const RGB &c) {
   char buf[8];
   snprintf(buf, sizeof(buf), "#%02x%02x%02x", c.r, c.g, c.b);
   return String(buf);
 }
 
-CRGB hexToColor(const String &hex) {
-  if (hex.length() < 7 || hex[0] != '#') return CRGB::Black;
+RGB hexToColor(const String &hex) {
+  if (hex.length() < 7 || hex[0] != '#') return COLOR_BLACK;
   long v = strtol(hex.substring(1).c_str(), nullptr, 16);
-  return CRGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+  return RGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
 }
 
 // ---------------------------------------------------------------------------
@@ -69,11 +131,16 @@ void saveConfig() {
   JsonDocument doc;
   doc["brightness"] = cfg.brightness;
   doc["bgMode"] = cfg.bgMode;
+  doc["style"] = cfg.style;
+  doc["rotationOffset"] = cfg.rotationOffset;
   doc["use24Hour"] = cfg.use24Hour;
+  doc["bstEnabled"] = cfg.bstEnabled;
+  doc["trailUnderHands"] = cfg.trailUnderHands;
   doc["hourColor"] = colorToHex(cfg.hourColor);
   doc["minuteColor"] = colorToHex(cfg.minuteColor);
   doc["secondColor"] = colorToHex(cfg.secondColor);
   doc["tickColor"] = colorToHex(cfg.tickColor);
+  doc["trailColor"] = colorToHex(cfg.trailColor);
   doc["timezone"] = cfg.timezone;
 
   String out;
@@ -90,11 +157,16 @@ void loadConfig() {
 
   cfg.brightness = doc["brightness"] | cfg.brightness;
   cfg.bgMode = doc["bgMode"] | cfg.bgMode;
+  cfg.style = doc["style"] | cfg.style;
+  cfg.rotationOffset = doc["rotationOffset"] | cfg.rotationOffset;
   cfg.use24Hour = doc["use24Hour"] | cfg.use24Hour;
+  cfg.bstEnabled = doc["bstEnabled"] | cfg.bstEnabled;
+  cfg.trailUnderHands = doc["trailUnderHands"] | cfg.trailUnderHands;
   if (doc["hourColor"].is<const char*>()) cfg.hourColor = hexToColor(doc["hourColor"].as<String>());
   if (doc["minuteColor"].is<const char*>()) cfg.minuteColor = hexToColor(doc["minuteColor"].as<String>());
   if (doc["secondColor"].is<const char*>()) cfg.secondColor = hexToColor(doc["secondColor"].as<String>());
   if (doc["tickColor"].is<const char*>()) cfg.tickColor = hexToColor(doc["tickColor"].as<String>());
+  if (doc["trailColor"].is<const char*>()) cfg.trailColor = hexToColor(doc["trailColor"].as<String>());
   if (doc["timezone"].is<const char*>()) cfg.timezone = doc["timezone"].as<String>();
 }
 
@@ -168,26 +240,56 @@ void checkAlarms(const struct tm &timeinfo) {
 void renderAlarm() {
   // Pulsing flash across the whole ring using the triggered alarm's colour
   // (falls back to red if somehow no alarm is flagged as the active one).
-  CRGB flashColor = CRGB::Red;
+  RGB flashColor = COLOR_RED;
   for (uint8_t i = 0; i < alarmCount; i++) {
     if (alarms[i].enabled) { flashColor = alarms[i].color; break; }
   }
   uint8_t pulse = beatsin8(60, 40, 255);
-  fill_solid(leds, NUM_LEDS, flashColor);
-  FastLED.setBrightness(pulse);
+  fillSolid(leds, NUM_LEDS, flashColor);
+  strip.setBrightness(pulse);
+}
+
+// Wraps a signed ring position into 0..NUM_LEDS-1, applying the configured
+// rotation offset so the ring's "12 o'clock" can be shifted physically.
+uint8_t pixelIndex(int pos) {
+  int idx = (pos + cfg.rotationOffset) % NUM_LEDS;
+  if (idx < 0) idx += NUM_LEDS;
+  return static_cast<uint8_t>(idx);
+}
+
+RGB scaleColor(const RGB &c, uint8_t scale) {
+  return RGB((c.r * scale) / 255, (c.g * scale) / 255, (c.b * scale) / 255);
+}
+
+// Cheap integer hash used to give each tick its own twinkle phase.
+uint8_t hash8(uint32_t x) {
+  x ^= x >> 16; x *= 0x7feb352dU;
+  x ^= x >> 15; x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return static_cast<uint8_t>(x & 0xFF);
 }
 
 void renderClock(const struct tm &timeinfo) {
-  FastLED.setBrightness(cfg.brightness);
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  strip.setBrightness(cfg.brightness);
+  fillSolid(leds, NUM_LEDS, COLOR_BLACK);
 
   // Background
   if (cfg.bgMode == 1) {
-    for (uint8_t i = 0; i < NUM_LEDS; i += 5) leds[i] = cfg.tickColor;
-  } else if (cfg.bgMode == 2) {
+    for (uint8_t i = 0; i < NUM_LEDS; i += 5) leds[pixelIndex(i)] = cfg.tickColor;
+  } else if (cfg.bgMode == 2 || cfg.bgMode == 3) {
     uint8_t hueBase = (millis() / 40) % 255;
     for (uint8_t i = 0; i < NUM_LEDS; i++) {
-      leds[i] = CHSV(hueBase + (i * 255 / NUM_LEDS), 255, 25);
+      leds[pixelIndex(i)] = hsvToRgb(hueBase + (i * 255 / NUM_LEDS), 255, 25);
+    }
+    if (cfg.bgMode == 3) {
+      // Twinkling white sparkle at each hour tick, each with its own phase.
+      unsigned long t = millis();
+      for (uint8_t i = 0; i < NUM_LEDS; i += 5) {
+        float phase = (t + hash8(i) * 37UL) / 300.0f;
+        float wave = (sinf(phase) + 1.0f) / 2.0f;
+        uint8_t twinkle = 30 + static_cast<uint8_t>(wave * 225);
+        leds[pixelIndex(i)] = scaleColor(RGB(255, 255, 255), twinkle);
+      }
     }
   }
 
@@ -195,9 +297,39 @@ void renderClock(const struct tm &timeinfo) {
   int minutePos = timeinfo.tm_min;
   int secondPos = timeinfo.tm_sec;
 
-  leds[hourPos % NUM_LEDS]   += cfg.hourColor;
-  leds[minutePos % NUM_LEDS] += cfg.minuteColor;
-  leds[secondPos % NUM_LEDS] += cfg.secondColor;
+  // Hands are assigned (not blended) so they always show cleanly over ticks.
+  auto drawHourMinute = [&]() {
+    leds[pixelIndex(hourPos)] = cfg.hourColor;
+    leds[pixelIndex(minutePos)] = cfg.minuteColor;
+  };
+
+  if (cfg.style == STYLE_SWEEP) {
+    // 5-LED fading comet trail that does one full lap of the ring per
+    // second, in cfg.trailColor. The second hand itself stays fixed in
+    // place at secondPos the whole time - only the trail moves.
+    constexpr uint8_t TRAIL_LEN = 5;
+    float fracSecond = (millis() % 1000) / 1000.0f;
+    int headPos = secondPos + static_cast<int>(fracSecond * NUM_LEDS);
+
+    auto drawTrail = [&]() {
+      for (uint8_t k = 0; k < TRAIL_LEN; k++) {
+        uint8_t scale = 255 - (k * (255 / TRAIL_LEN));
+        leds[pixelIndex(headPos - k)] = scaleColor(cfg.trailColor, scale);
+      }
+    };
+
+    if (cfg.trailUnderHands) {
+      drawTrail();
+      drawHourMinute();
+    } else {
+      drawHourMinute();
+      drawTrail();
+    }
+    leds[pixelIndex(secondPos)] = cfg.secondColor; // always visible, drawn last
+  } else {
+    drawHourMinute();
+    leds[pixelIndex(secondPos)] = cfg.secondColor;
+  }
 }
 
 // Shows the last octet of the IP as three digit-groups of lit LEDs (separated
@@ -212,21 +344,21 @@ void showIpOnLeds(const IPAddress &ip) {
   };
   const uint8_t gap = 5;
 
-  FastLED.setBrightness(cfg.brightness);
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  strip.setBrightness(cfg.brightness);
+  fillSolid(leds, NUM_LEDS, COLOR_BLACK);
 
   uint8_t pos = 0;
   for (uint8_t i = 0; i < 3 && pos < NUM_LEDS; i++) {
     for (uint8_t j = 0; j < digits[i] && pos < NUM_LEDS; j++, pos++) {
-      leds[pos] = CRGB::Green;
+      leds[pos] = COLOR_GREEN;
     }
     pos += gap;
   }
 
-  FastLED.show();
+  pushLeds();
   delay(5000);
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  FastLED.show();
+  fillSolid(leds, NUM_LEDS, COLOR_BLACK);
+  pushLeds();
 }
 
 // ---------------------------------------------------------------------------
@@ -260,11 +392,16 @@ void handleGetConfig(AsyncWebServerRequest *request) {
   JsonDocument doc;
   doc["brightness"] = cfg.brightness;
   doc["bgMode"] = cfg.bgMode;
+  doc["style"] = cfg.style;
+  doc["rotationOffset"] = cfg.rotationOffset;
   doc["use24Hour"] = cfg.use24Hour;
+  doc["bstEnabled"] = cfg.bstEnabled;
+  doc["trailUnderHands"] = cfg.trailUnderHands;
   doc["hourColor"] = colorToHex(cfg.hourColor);
   doc["minuteColor"] = colorToHex(cfg.minuteColor);
   doc["secondColor"] = colorToHex(cfg.secondColor);
   doc["tickColor"] = colorToHex(cfg.tickColor);
+  doc["trailColor"] = colorToHex(cfg.trailColor);
   doc["timezone"] = cfg.timezone;
 
   String out;
@@ -289,8 +426,11 @@ void handleGetAlarms(AsyncWebServerRequest *request) {
   request->send(200, "application/json", out);
 }
 
+// When bstEnabled, applies the UK's auto GMT/BST daylight-saving rule
+// regardless of `timezone`; otherwise uses `timezone` verbatim.
 void applyTimezone() {
-  setenv("TZ", cfg.timezone.c_str(), 1);
+  const char *tz = cfg.bstEnabled ? "GMT0BST,M3.5.0/1,M10.5.0" : cfg.timezone.c_str();
+  setenv("TZ", tz, 1);
   tzset();
 }
 
@@ -314,11 +454,16 @@ void setupWebServer() {
       }
       cfg.brightness = doc["brightness"] | cfg.brightness;
       cfg.bgMode = doc["bgMode"] | cfg.bgMode;
+      cfg.style = doc["style"] | cfg.style;
+      cfg.rotationOffset = doc["rotationOffset"] | cfg.rotationOffset;
       cfg.use24Hour = doc["use24Hour"] | cfg.use24Hour;
+      cfg.bstEnabled = doc["bstEnabled"] | cfg.bstEnabled;
+      cfg.trailUnderHands = doc["trailUnderHands"] | cfg.trailUnderHands;
       if (doc["hourColor"].is<const char*>()) cfg.hourColor = hexToColor(doc["hourColor"].as<String>());
       if (doc["minuteColor"].is<const char*>()) cfg.minuteColor = hexToColor(doc["minuteColor"].as<String>());
       if (doc["secondColor"].is<const char*>()) cfg.secondColor = hexToColor(doc["secondColor"].as<String>());
       if (doc["tickColor"].is<const char*>()) cfg.tickColor = hexToColor(doc["tickColor"].as<String>());
+      if (doc["trailColor"].is<const char*>()) cfg.trailColor = hexToColor(doc["trailColor"].as<String>());
       if (doc["timezone"].is<const char*>()) cfg.timezone = doc["timezone"].as<String>();
 
       saveConfig();
@@ -374,10 +519,10 @@ void setupWebServer() {
 void setup() {
   Serial.begin(115200);
 
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
-  FastLED.setBrightness(cfg.brightness);
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  FastLED.show();
+  strip.begin();
+  strip.setBrightness(cfg.brightness);
+  fillSolid(leds, NUM_LEDS, COLOR_BLACK);
+  pushLeds();
 
   prefs.begin("clockcfg", false);
   loadConfig();
@@ -420,7 +565,7 @@ void loop() {
     } else {
       renderClock(timeinfo);
     }
-    FastLED.show();
+    pushLeds();
   }
 
   delay(20); // ~50fps, plenty smooth for a second hand, keeps AsyncWebServer responsive
